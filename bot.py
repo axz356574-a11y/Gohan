@@ -314,6 +314,48 @@ async def on_message(message):
     # keep commands working
     await bot.process_commands(message)
 
+from nextcord import Interaction, SlashOption, Embed
+from googletrans import Translator
+
+translator = Translator()
+
+@bot.slash_command(
+    name="translate",
+    description="Translate text to another language"
+)
+async def translate(
+    interaction: Interaction,
+    text: str = SlashOption(
+        description="Text you want translated",
+        required=True
+    ),
+    language: str = SlashOption(
+        description="Language code (en, hi, ja, es, fr...)",
+        required=True
+    )
+):
+
+    # First message
+    await interaction.response.send_message("I got this 🔥")
+
+    try:
+        # Perform translation
+        translated = translator.translate(text, dest=language)
+
+        # Create the embed
+        embed = Embed(
+            title="🌐 Translation Complete",
+            description=f"**Translated to `{language}`:**\n\n{translated.text}",
+            color=0x00FFAE
+        )
+        embed.set_footer(text="Saiyan-grade translation ⚡")
+
+        # Send embed
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error: `{e}`\nInvalid language code?")
+
 # -----------------------------
 # BOT READY
 # -----------------------------
