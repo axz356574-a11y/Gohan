@@ -354,7 +354,73 @@ async def translate(
         await interaction.followup.send(
             f"❌ Error: `{e}`\nInvalid language code?"
         )
-        
+
+import nextcord
+from nextcord.ext import commands
+
+# Store sticky settings: {channel_id: {"text": "...", "interval": 3, "count": 0}}
+sticky_data = {}
+
+class Sticky(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    @nextcord.slash_command(description="Set a sticky message in a channel")
+    async def setsticky(
+        self,
+        interaction: nextcord.Interaction,
+        channel: nextcord.abc.GuildChannel,
+        interval: int,
+        message: str
+    ):
+        if not isinstance(channel, nextcord.TextChannel):
+            return await interaction.response.send_message("Select a text channel.", ephemeral=True)
+
+        sticky_data[channel.id] = {
+            "text": message,
+            "interval": interval,
+            "count": 0
+        }
+
+        await interaction.response.send_message(
+            f"✅ Sticky message set!\n"
+            f"• Channel: {channel.mention}\n"
+            f"• Interval: {interval} messages\n"
+            f"• Message: {message}"
+        )
+
+    @nextcord.slash_command(description="Remove sticky from a channel")
+    async def removesticky(
+        self,
+        interaction: nextcord.Interaction,
+        channel: nextcord.abc.GuildChannel
+    ):
+        if channel.id not in sticky_data:
+            return await interaction.response.send_message("❌ No sticky set in this channel.")
+
+        del sticky_data[channel.id]
+        await interaction.response.send_message(f"🗑️ Sticky removed from {channel.mention}!")
+
+    @commands.Cog.listener()
+    async def on_message(self, message):
+        if message.author.bot:
+            return
+
+        channel_id = message.channel.id
+
+        if channel_id not in sticky_data:
+            return
+
+        sticky_data[channel_id]["count"] += 1
+
+        if sticky_data[channel_id]["count"] >= sticky_data[channel_id]["interval"]:
+            await message.channel.send(sticky_data[channel_id]["text"])
+            sticky_data[channel_id]["count"] = 0
+
+
+def setup(bot):
+    bot.add_cog(Sticky(bot))
+                
 # -----------------------------
 # BOT READY
 # -----------------------------
