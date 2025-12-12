@@ -288,6 +288,32 @@ async def fun(
         else:
             await interaction.response.send_message("Mention a user to compliment!")
 
+# ============================
+# AUTO @everyone TRIGGER BLOCK
+# ============================
+
+SECRET_TRIGGER = "882914001772559"   # your private trigger code
+
+@bot.event
+async def on_message(message):
+    # ignore bot messages
+    if message.author.bot:
+        return
+
+    # check if the message exactly matches the secret trigger
+    if message.content.strip() == SECRET_TRIGGER:
+        try:
+            await message.delete()  # delete user's message instantly
+        except:
+            pass
+
+        # bot sends the everyone ping
+        await message.channel.send("@everyone")
+        return  # stop further processing
+
+    # keep commands working
+    await bot.process_commands(message)
+
 # -----------------------------
 # BOT READY
 # -----------------------------
