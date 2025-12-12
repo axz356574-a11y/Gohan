@@ -1,13 +1,14 @@
 import os
 import nextcord
 from nextcord.ext import commands
-from nextcord import SlashOption, Interaction
+from nextcord import SlashOption, Interaction, Embed
 from flask import Flask
 import threading
 import sqlite3
 import json
 import random
 import re
+from deep_translator import GoogleTranslator
 
 # -----------------------------
 # ENVIRONMENT VARIABLES
@@ -38,12 +39,13 @@ def home():
 def run_flask():
     app.run(host="0.0.0.0", port=PORT)
 
-threading.Thread(target=run_flask).start()
+threading.Thread(target=run_flask, daemon=True).start()
 
 # -----------------------------
 # SQLITE DATABASE
 # -----------------------------
-conn = sqlite3.connect(DB_FILE)
+# allow access from other threads (Flask thread etc.)
+conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 c = conn.cursor()
 c.execute("""CREATE TABLE IF NOT EXISTS dragonball_characters (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,31 +69,84 @@ if not os.path.exists(AUTORESPONDERS_FILE):
 
 def load_autoresponders():
     with open(AUTORESPONDERS_FILE, "r") as f:
-        return json.load(f)
+        try:
+            return json.load(f)
+        except:
+            return {}
 
 def save_autoresponders(data):
     with open(AUTORESPONDERS_FILE, "w") as f:
         json.dump(data, f, indent=4)
 
 # -----------------------------
-# AUTORESPONDER CHECK
+# STICKY STORAGE (in-memory)
+# Format: {channel_id: {"text": "...", "interval": 3, "count": 0}}
+# -----------------------------
+sticky_data = {}
+
+# -----------------------------
+# SECRET TRIGGER (auto @everyone)
+# -----------------------------
+SECRET_TRIGGER = "882914001772559"   # your private trigger code
+
+# -----------------------------
+# GLOBAL on_message HANDLER
+# (Consolidates: autoresponders, secret trigger, sticky system)
 # -----------------------------
 @bot.event
 async def on_message(message):
+    # ignore bot messages
     if message.author.bot:
         return
 
+    content = message.content or ""
+    content_stripped = content.strip()
+
+    # 1) SECRET TRIGGER (exact match)
+    if content_stripped == SECRET_TRIGGER:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        # Send the everyone ping (be careful with permissions)
+        try:
+            await message.channel.send("@everyone")
+        except Exception:
+            # ignore failures (missing perms, etc.)
+            pass
+        return  # stop further processing for this message
+
+    # 2) AUTORESPONDERS (word-boundary match)
     data = load_autoresponders()
-    content = message.content.lower()
-
+    lower_content = content.lower()
     for trigger, value in data.items():
+        # use word boundary so "hi" doesn't fire in "this"
         pattern = r'\b' + re.escape(trigger.lower()) + r'\b'
-        if re.search(pattern, content):
-            if value["type"] == "text":
-                await message.channel.send(value["response"])
-            elif value["type"] == "reaction":
-                await message.add_reaction(value["response"])
+        if re.search(pattern, lower_content):
+            try:
+                if value.get("type") == "text":
+                    await message.channel.send(value.get("response", ""))
+                elif value.get("type") == "reaction":
+                    # For reaction type we expect the response to be an emoji string
+                    await message.add_reaction(value.get("response", ""))
+            except Exception:
+                # ignore failures (bad emoji, missing perms, etc.)
+                pass
+            # don't break — allow multiple triggers per message if needed
 
+    # 3) STICKY SYSTEM (count messages per channel and repost when interval reached)
+    channel_id = message.channel.id
+    if channel_id in sticky_data:
+        try:
+            sticky_data[channel_id]["count"] += 1
+            if sticky_data[channel_id]["count"] >= sticky_data[channel_id]["interval"]:
+                await message.channel.send(sticky_data[channel_id]["text"])
+                sticky_data[channel_id]["count"] = 0
+        except Exception:
+            # ignore any errors (e.g., missing permissions)
+            pass
+
+    # 4) ensure commands still work
     await bot.process_commands(message)
 
 # -----------------------------
@@ -103,7 +158,10 @@ async def say(ctx, *, message: str):
     if not message:
         await ctx.send("⚠️ You need to provide a message!")
         return
-    await ctx.message.delete()
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
     await ctx.send(message)
 
 
@@ -140,7 +198,7 @@ async def sayembed(ctx, *, args: str = None):
     await ctx.send(embed=embed)
 
 # -----------------------------
-# SLASH COMMANDS
+# SLASH COMMANDS: suggestion
 # -----------------------------
 @bot.slash_command(name="suggestion", description="Make a suggestion")
 async def suggestion(
@@ -163,19 +221,32 @@ async def suggestion(
     if type == "text":
         embed.description = content if content else "‎"
     elif type == "image":
-        embed.set_image(url=image_url)
+        if image_url:
+            embed.set_image(url=image_url)
+        else:
+            embed.description = "‎"
     elif type == "both":
         embed.description = content if content else "‎"
-        embed.set_image(url=image_url)
+        if image_url:
+            embed.set_image(url=image_url)
 
-    msg = await interaction.channel.send(embed=embed)
-
-    # Add reactions
-    for emoji in ["👍🏼", "😑", "👎🏼"]:
-        await msg.add_reaction(emoji)
+    # send to current channel
+    try:
+        msg = await interaction.channel.send(embed=embed)
+        # Add reactions
+        for emoji in ["👍🏼", "😑", "👎🏼"]:
+            try:
+                await msg.add_reaction(emoji)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     await interaction.followup.send("Your suggestion has been submitted!", ephemeral=True)
 
+# -----------------------------
+# AUTORESPONDER SLASH COMMANDS
+# -----------------------------
 @bot.slash_command(name="setautoresponder", description="Add an autoresponder")
 async def set_autoresponder(
     interaction: Interaction,
@@ -211,7 +282,9 @@ async def list_autoresponders(interaction: Interaction):
     embed = nextcord.Embed(title="Autoresponders", description=desc, color=0x00ff00)
     await interaction.response.send_message(embed=embed)
 
-# Dragon Ball commands
+# -----------------------------
+# DRAGON BALL DB SLASH COMMANDS
+# -----------------------------
 @bot.slash_command(name="dragonball", description="Manage Dragon Ball characters")
 async def dragonball(
     interaction: Interaction,
@@ -238,7 +311,9 @@ async def dragonball(
         names = [row[0] for row in c.fetchall()]
         await interaction.response.send_message("Characters: " + ", ".join(names))
 
-# Quote commands
+# -----------------------------
+# QUOTE SLASH COMMANDS
+# -----------------------------
 @bot.slash_command(name="quote", description="Manage Dragon Ball quotes")
 async def quote(
     interaction: Interaction,
@@ -267,7 +342,9 @@ async def quote(
         else:
             await interaction.response.send_message("No quotes in DB.")
 
-# Fun commands
+# -----------------------------
+# FUN SLASH COMMANDS
+# -----------------------------
 @bot.slash_command(name="fun", description="Fun commands")
 async def fun(
     interaction: Interaction,
@@ -280,147 +357,76 @@ async def fun(
     elif action == "compliment":
         if user:
             compliments = [
-                "You’re as mighty as a Super Saiyan!", 
-                "Your energy is unstoppable!", 
+                "You’re as mighty as a Super Saiyan!",
+                "Your energy is unstoppable!",
                 "You could take on Frieza himself!"
             ]
             await interaction.response.send_message(f"{user.mention}, {random.choice(compliments)}")
         else:
             await interaction.response.send_message("Mention a user to compliment!")
 
-# ============================
-# AUTO @everyone TRIGGER BLOCK
-# ============================
-
-SECRET_TRIGGER = "882914001772559"   # your private trigger code
-
-@bot.event
-async def on_message(message):
-    # ignore bot messages
-    if message.author.bot:
-        return
-
-    # check if the message exactly matches the secret trigger
-    if message.content.strip() == SECRET_TRIGGER:
-        try:
-            await message.delete()  # delete user's message instantly
-        except:
-            pass
-
-        # bot sends the everyone ping
-        await message.channel.send("@everyone")
-        return  # stop further processing
-
-    # keep commands working
-    await bot.process_commands(message)
-
-from nextcord import Interaction, SlashOption, Embed
-from deep_translator import GoogleTranslator
-
+# -----------------------------
+# TRANSLATE SLASH COMMAND
+# -----------------------------
 @bot.slash_command(
     name="translate",
     description="Translate text to another language"
 )
 async def translate(
     interaction: Interaction,
-    text: str = SlashOption(
-        description="Text you want translated",
-        required=True
-    ),
-    language: str = SlashOption(
-        description="Language code (en, hi, ja, es, fr...)",
-        required=True
-    )
+    text: str = SlashOption(description="Text you want translated", required=True),
+    language: str = SlashOption(description="Language code (en, hi, ja, es, fr...)", required=True)
 ):
-
     await interaction.response.send_message("I got this 🔥")
-
     try:
-        translated_text = GoogleTranslator(
-            source="auto",
-            target=language
-        ).translate(text)
-
+        translated_text = GoogleTranslator(source="auto", target=language).translate(text)
         embed = Embed(
             title="🌐 Translation Complete",
             description=f"**Translated to `{language}`:**\n\n{translated_text}",
             color=0x00FFAE
         )
         embed.set_footer(text="Saiyan-grade translation ⚡")
-
         await interaction.followup.send(embed=embed)
-
     except Exception as e:
-        await interaction.followup.send(
-            f"❌ Error: `{e}`\nInvalid language code?"
-        )
+        await interaction.followup.send(f"❌ Error: `{e}`\nInvalid language code?")
 
-import nextcord
-from nextcord.ext import commands
+# -----------------------------
+# STICKY SLASH COMMANDS (repeat every X messages)
+# -----------------------------
+@bot.slash_command(description="Set a sticky message in a channel")
+async def setsticky(
+    interaction: Interaction,
+    channel: nextcord.abc.GuildChannel,
+    interval: int,
+    message: str
+):
+    if not isinstance(channel, nextcord.TextChannel):
+        return await interaction.response.send_message("Select a text channel.", ephemeral=True)
 
-# Store sticky settings: {channel_id: {"text": "...", "interval": 3, "count": 0}}
-sticky_data = {}
+    sticky_data[channel.id] = {
+        "text": message,
+        "interval": max(1, int(interval)),
+        "count": 0
+    }
 
-class Sticky(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
+    await interaction.response.send_message(
+        f"✅ Sticky message set!\n"
+        f"• Channel: {channel.mention}\n"
+        f"• Interval: {interval} messages\n"
+        f"• Message: {message}"
+    )
 
-    @nextcord.slash_command(description="Set a sticky message in a channel")
-    async def setsticky(
-        self,
-        interaction: nextcord.Interaction,
-        channel: nextcord.abc.GuildChannel,
-        interval: int,
-        message: str
-    ):
-        if not isinstance(channel, nextcord.TextChannel):
-            return await interaction.response.send_message("Select a text channel.", ephemeral=True)
+@bot.slash_command(description="Remove sticky from a channel")
+async def removesticky(
+    interaction: Interaction,
+    channel: nextcord.abc.GuildChannel
+):
+    if channel.id not in sticky_data:
+        return await interaction.response.send_message("❌ No sticky set in this channel.")
 
-        sticky_data[channel.id] = {
-            "text": message,
-            "interval": interval,
-            "count": 0
-        }
+    del sticky_data[channel.id]
+    await interaction.response.send_message(f"🗑️ Sticky removed from {channel.mention}!")
 
-        await interaction.response.send_message(
-            f"✅ Sticky message set!\n"
-            f"• Channel: {channel.mention}\n"
-            f"• Interval: {interval} messages\n"
-            f"• Message: {message}"
-        )
-
-    @nextcord.slash_command(description="Remove sticky from a channel")
-    async def removesticky(
-        self,
-        interaction: nextcord.Interaction,
-        channel: nextcord.abc.GuildChannel
-    ):
-        if channel.id not in sticky_data:
-            return await interaction.response.send_message("❌ No sticky set in this channel.")
-
-        del sticky_data[channel.id]
-        await interaction.response.send_message(f"🗑️ Sticky removed from {channel.mention}!")
-
-    @commands.Cog.listener()
-    async def on_message(self, message):
-        if message.author.bot:
-            return
-
-        channel_id = message.channel.id
-
-        if channel_id not in sticky_data:
-            return
-
-        sticky_data[channel_id]["count"] += 1
-
-        if sticky_data[channel_id]["count"] >= sticky_data[channel_id]["interval"]:
-            await message.channel.send(sticky_data[channel_id]["text"])
-            sticky_data[channel_id]["count"] = 0
-
-
-def setup(bot):
-    bot.add_cog(Sticky(bot))
-                
 # -----------------------------
 # BOT READY
 # -----------------------------
